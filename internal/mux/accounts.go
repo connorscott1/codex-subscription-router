@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/b-nnett/codex-subscription-router/internal/state"
@@ -122,6 +123,52 @@ func (m *Multiplexer) ThreadAccount(ctx context.Context, threadID string) (Accou
 		return AccountSnapshot{}, fmt.Errorf("thread %q has no subscription assignment", threadID)
 	}
 	return m.accountSnapshotWithProfile(ctx, accountID, true)
+}
+
+// SwitchThreadAccount resumes an existing chat on another subscription while
+// preserving its thread ID and rollout history.
+func (m *Multiplexer) SwitchThreadAccount(ctx context.Context, threadID, targetAccountID string) (AccountSnapshot, error) {
+	threadID = strings.TrimSpace(threadID)
+	targetAccountID = strings.TrimSpace(targetAccountID)
+	if threadID == "" || targetAccountID == "" {
+		return AccountSnapshot{}, errors.New("threadId and accountId are required")
+	}
+	sourceAccountID, ok := m.store.ThreadOwner(threadID)
+	if !ok {
+		return AccountSnapshot{}, fmt.Errorf("thread %q has no subscription assignment", threadID)
+	}
+	target, err := m.accountSnapshotWithProfile(ctx, targetAccountID, true)
+	if err != nil {
+		return AccountSnapshot{}, err
+	}
+	if !target.Enabled || !target.Connected || target.AuthType != "chatgpt" {
+		return AccountSnapshot{}, fmt.Errorf("subscription %q is not available", target.Label)
+	}
+	if !accountHasCapacity(target) {
+		return AccountSnapshot{}, fmt.Errorf("subscription %q has no usage remaining", target.Label)
+	}
+	if sourceAccountID == targetAccountID {
+		return target, nil
+	}
+	m.activeTurnsMu.Lock()
+	_, active := m.activeTurns[threadID]
+	m.activeTurnsMu.Unlock()
+	if active {
+		return AccountSnapshot{}, errors.New("wait for the current turn to finish before switching subscriptions")
+	}
+	if err := m.resumeThreadOnAccount(ctx, threadID, sourceAccountID, targetAccountID); err != nil {
+		return AccountSnapshot{}, err
+	}
+	if err := m.store.SetThreadOwner(threadID, targetAccountID); err != nil {
+		return AccountSnapshot{}, err
+	}
+	m.publish(Event{
+		Type:      "thread-account-changed",
+		AccountID: targetAccountID,
+		Message:   fmt.Sprintf("Chat moved to %s", target.Label),
+		Data:      map[string]any{"threadId": threadID, "previousAccountId": sourceAccountID},
+	})
+	return target, nil
 }
 
 func (m *Multiplexer) StartLogin(ctx context.Context, id, mode string) (json.RawMessage, error) {
@@ -240,8 +287,13 @@ func (m *Multiplexer) chooseAccount(ctx context.Context) (state.Account, RouteRe
 
 func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[string]struct{}) (state.Account, RouteReason, error) {
 	snapshots := m.accountSnapshots(ctx, false)
+	accountOrder := make(map[string]int)
+	for index, account := range m.store.Accounts() {
+		accountOrder[account.ID] = index
+	}
 	type candidate struct {
 		account      state.Account
+		order        int
 		reason       RouteReason
 		weekly       *RateLimitWindow
 		weeklyUsed   float64
@@ -262,7 +314,7 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 			continue
 		}
 		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly != nil && weekly.UsedPercent >= 100 {
+		if windowDepleted(weekly) || windowDepleted(short) {
 			continue
 		}
 		weeklyUsed := 1_000.0
@@ -281,7 +333,7 @@ func (m *Multiplexer) chooseAccountExcluding(ctx context.Context, excluded map[s
 			reason.ShortUsedPercent = &short.UsedPercent
 		}
 		candidates = append(candidates, candidate{
-			account: account, reason: reason, weekly: weekly,
+			account: account, order: accountOrder[account.ID], reason: reason, weekly: weekly,
 			weeklyUsed: weeklyUsed, shortUsed: shortUsed,
 		})
 	}
@@ -342,7 +394,13 @@ collectResetCredits:
 		if left.reason.ThreadCount != right.reason.ThreadCount {
 			return left.reason.ThreadCount < right.reason.ThreadCount
 		}
-		return left.account.CreatedAt < right.account.CreatedAt
+		if left.account.CreatedAt != right.account.CreatedAt {
+			return left.account.CreatedAt < right.account.CreatedAt
+		}
+		if left.order != right.order {
+			return left.order < right.order
+		}
+		return left.account.ID < right.account.ID
 	})
 	return candidates[0].account, candidates[0].reason, nil
 }
@@ -398,8 +456,8 @@ func aggregateRateLimits(snapshots []AccountSnapshot) (*RateLimits, error) {
 			primary = append(primary, snapshot.RateLimits.Primary)
 			secondary = append(secondary, snapshot.RateLimits.Secondary)
 		}
-		weekly, _ := longestAndShortestWindow(snapshot.RateLimits)
-		if weekly == nil || weekly.UsedPercent < 100 {
+		weekly, short := longestAndShortestWindow(snapshot.RateLimits)
+		if !windowDepleted(weekly) && !windowDepleted(short) {
 			hasCapacity = true
 		}
 	}
@@ -472,6 +530,10 @@ func duration(window *RateLimitWindow) int64 {
 		return 0
 	}
 	return *window.WindowDurationMins
+}
+
+func windowDepleted(window *RateLimitWindow) bool {
+	return window != nil && window.UsedPercent >= 100
 }
 
 func contextWithControlTimeout(parent context.Context) (context.Context, context.CancelFunc) {
