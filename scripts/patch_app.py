@@ -18,6 +18,8 @@ import tempfile
 import time
 from pathlib import Path
 
+import migrate_legacy_state
+
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PROJECT_VERSION = (PROJECT_ROOT / "VERSION").read_text(encoding="utf-8").strip()
@@ -79,6 +81,19 @@ def parse_args() -> argparse.Namespace:
         "--allow-signing-team-change",
         action="store_true",
         help="Replace an existing build signed by a different Apple team.",
+    )
+    parser.add_argument(
+        "--migrate-legacy-state",
+        action="store_true",
+        help=(
+            "Explicitly migrate legacy rollout and SQLite state while the official "
+            "and router apps are stopped; never implied by --force."
+        ),
+    )
+    parser.add_argument(
+        "--retire-stale-helper",
+        action="store_true",
+        help="Move aside a legacy custom helper under ~/.codex; never done implicitly.",
     )
     return parser.parse_args()
 
@@ -1144,6 +1159,8 @@ def patch_app(
     allow_adhoc_signing: bool,
     allow_untested_source: bool,
     allow_signing_team_change: bool,
+    migrate_legacy_state_requested: bool,
+    retire_stale_helper_requested: bool,
 ) -> None:
     source = source.expanduser().resolve()
     destination = destination.expanduser().resolve()
@@ -1199,6 +1216,12 @@ def patch_app(
             )
     destination.parent.mkdir(parents=True, exist_ok=True)
     installed_computer_use_app = destination.parent / COMPUTER_USE_APP_NAME
+    migration_plan = None
+    if migrate_legacy_state_requested:
+        migration_plan = migrate_legacy_state.plan_migration(
+            DEFAULT_STATE_ROOT,
+            Path.home() / ".codex",
+        )
     if force:
         ensure_components_are_stopped((destination, installed_computer_use_app))
 
@@ -1294,11 +1317,17 @@ def patch_app(
         helper_backup = backup_directory / installed_computer_use_app.name
         had_app = destination.exists()
         had_helper = installed_computer_use_app.exists()
+        migration_receipt = None
         if had_app or had_helper:
             backup_directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             backup_directory.parent.chmod(0o700)
             backup_directory.mkdir(mode=0o700, parents=True, exist_ok=False)
         try:
+            if migration_plan is not None and migration_plan.needed:
+                migration_receipt = migrate_legacy_state.execute_migration(
+                    migration_plan,
+                    (source, destination, installed_computer_use_app),
+                )
             if had_app:
                 destination.rename(app_backup)
                 print(f"Existing copy moved to {app_backup}")
@@ -1320,7 +1349,18 @@ def patch_app(
                 app_backup.rename(destination)
             if helper_backup.exists():
                 helper_backup.rename(installed_computer_use_app)
+            if migration_receipt is not None:
+                migration_receipt.rollback()
             raise
+        if migration_receipt is not None:
+            try:
+                migration_receipt.commit()
+            except OSError as error:
+                print(
+                    "Warning: installation and migration completed, but the "
+                    f"migration completion marker could not be written: {error}",
+                    file=sys.stderr,
+                )
 
     if LAUNCH_SERVICES_REGISTER.is_file():
         run(
@@ -1331,7 +1371,8 @@ def patch_app(
                 str(installed_computer_use_app),
             ]
         )
-    retire_stale_cached_computer_use_app()
+    if retire_stale_helper_requested:
+        retire_stale_cached_computer_use_app()
 
     print(destination)
     print(installed_computer_use_app)
@@ -1347,6 +1388,8 @@ def main() -> int:
             args.allow_adhoc_signing,
             args.allow_untested_source,
             args.allow_signing_team_change,
+            args.migrate_legacy_state,
+            args.retire_stale_helper,
         )
     except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
         print(f"patch failed: {error}", file=sys.stderr)

@@ -172,3 +172,53 @@ func TestUpdateAccountPreservesController(t *testing.T) {
 		t.Fatalf("unexpected updated account: %#v", account)
 	}
 }
+
+func TestOpenRefusesImplicitLegacyRolloutMigration(t *testing.T) {
+	root := t.TempDir()
+	primaryHome := filepath.Join(root, "primary")
+	muxRoot := filepath.Join(root, "mux")
+	store, err := Open(muxRoot, primaryHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, err := store.AddAccount("Work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(account.CodexHome, "sessions")); err != nil {
+		t.Fatal(err)
+	}
+	rolloutRelative := filepath.Join("2026", "08", "29", "rollout-thread.jsonl")
+	isolatedRollout := filepath.Join(account.CodexHome, "sessions", rolloutRelative)
+	if err := os.MkdirAll(filepath.Dir(isolatedRollout), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(isolatedRollout, []byte("rollout\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(muxRoot, primaryHome); err == nil || !strings.Contains(err.Error(), "explicit offline migration") {
+		t.Fatalf("expected a fail-closed migration error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(primaryHome, "sessions", rolloutRelative)); !os.IsNotExist(err) {
+		t.Fatalf("legacy rollout was copied during ordinary startup: %v", err)
+	}
+	if data, err := os.ReadFile(isolatedRollout); err != nil || string(data) != "rollout\n" {
+		t.Fatalf("legacy rollout changed after refusal: data=%q err=%v", data, err)
+	}
+}
+
+func TestSetThreadOwnerRollsBackMemoryWhenPersistenceFails(t *testing.T) {
+	root := t.TempDir()
+	store, err := Open(filepath.Join(root, "mux"), filepath.Join(root, "primary"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.path = filepath.Join(root, "missing", "state.json")
+	if err := store.SetThreadOwner("thread-1", "primary"); err == nil {
+		t.Fatal("expected persistence failure")
+	}
+	if owner, ok := store.ThreadOwner("thread-1"); ok {
+		t.Fatalf("failed persistence left in-memory owner %q", owner)
+	}
+}

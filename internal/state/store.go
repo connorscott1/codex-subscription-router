@@ -31,8 +31,9 @@ type persistedState struct {
 	ThreadOwner map[string]string `json:"threadOwner"`
 }
 
-// Store persists only routing metadata. OAuth credentials and conversation
-// databases remain inside each account's isolated Codex home.
+// Store persists routing metadata. OAuth credentials remain isolated. Rollout
+// files and the SQLite thread index may be shared only after the explicit,
+// offline migration has completed.
 type Store struct {
 	mu               sync.RWMutex
 	root             string
@@ -92,6 +93,9 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 		if samePath(account.CodexHome, primaryCodexHome) {
 			continue
 		}
+		if err := ensureSharedRolloutStorage(primaryCodexHome, account.CodexHome); err != nil {
+			return nil, fmt.Errorf("verify account %q rollout storage: %w", account.ID, err)
+		}
 		if err := syncIsolatedConfig(primaryCodexHome, account.CodexHome); err != nil {
 			return nil, fmt.Errorf("sync account %q config: %w", account.ID, err)
 		}
@@ -101,6 +105,10 @@ func Open(root, primaryCodexHome string) (*Store, error) {
 
 func (s *Store) Root() string {
 	return s.root
+}
+
+func (s *Store) PrimaryCodexHome() string {
+	return s.primaryCodexHome
 }
 
 // SyncManagedConfig propagates desktop-managed configuration (including
@@ -177,6 +185,9 @@ func (s *Store) AddAccount(label string) (Account, error) {
 	if err := syncIsolatedConfig(s.primaryCodexHome, codexHome); err != nil {
 		return Account{}, fmt.Errorf("write account config: %w", err)
 	}
+	if err := ensureSharedRolloutStorage(s.primaryCodexHome, codexHome); err != nil {
+		return Account{}, fmt.Errorf("share account rollouts: %w", err)
+	}
 
 	account := Account{
 		ID:        id,
@@ -190,6 +201,46 @@ func (s *Store) AddAccount(label string) (Account, error) {
 		return Account{}, err
 	}
 	return account, nil
+}
+
+func ensureSharedRolloutStorage(primaryCodexHome, isolatedCodexHome string) error {
+	for _, name := range []string{"sessions", "archived_sessions"} {
+		primaryPath := filepath.Join(primaryCodexHome, name)
+		isolatedPath := filepath.Join(isolatedCodexHome, name)
+		if err := os.MkdirAll(primaryPath, 0o700); err != nil {
+			return fmt.Errorf("create shared %s: %w", name, err)
+		}
+		info, err := os.Lstat(isolatedPath)
+		switch {
+		case errors.Is(err, os.ErrNotExist):
+			if err := os.Symlink(primaryPath, isolatedPath); err != nil {
+				return fmt.Errorf("link %s: %w", name, err)
+			}
+		case err != nil:
+			return fmt.Errorf("inspect %s: %w", name, err)
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := filepath.EvalSymlinks(isolatedPath)
+			if err != nil {
+				return fmt.Errorf("resolve %s link: %w", name, err)
+			}
+			resolvedPrimary, err := filepath.EvalSymlinks(primaryPath)
+			if err != nil {
+				return fmt.Errorf("resolve shared %s: %w", name, err)
+			}
+			if !samePath(target, resolvedPrimary) {
+				return fmt.Errorf("%s already links to %q", isolatedPath, target)
+			}
+		case info.IsDir():
+			return fmt.Errorf(
+				"legacy %s directory requires the explicit offline migration: %s",
+				name,
+				isolatedPath,
+			)
+		default:
+			return fmt.Errorf("%s is not a directory", isolatedPath)
+		}
+	}
+	return nil
 }
 
 func (s *Store) UpdateAccount(id string, label *string, enabled *bool) (Account, error) {
@@ -233,8 +284,17 @@ func (s *Store) SetThreadOwner(threadID, accountID string) error {
 	if s.owners[threadID] == accountID {
 		return nil
 	}
+	previous, hadPrevious := s.owners[threadID]
 	s.owners[threadID] = accountID
-	return s.saveLocked()
+	if err := s.saveLocked(); err != nil {
+		if hadPrevious {
+			s.owners[threadID] = previous
+		} else {
+			delete(s.owners, threadID)
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ThreadCounts() map[string]int {
