@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -47,14 +48,36 @@ PREFERRED_SIGNING_IDENTITY_PREFIXES = (
 )
 OPENAI_INTERNAL_TEAM_IDENTIFIER = "HX7739G8FX"
 OPENAI_DISTRIBUTION_TEAM_IDENTIFIER = "2DC432GLL2"
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceBuild:
+    asar_hash: str
+    renderer_layout: str
+    cua_package_replacements: int
+    asar_cua_replacements: int
+
+
 TESTED_SOURCE_BUILDS = {
     (
         "26.803.61601",
         "6396",
-    ): "d5a44ed9e2f1db5f81dbbe85408aed256f3203c5b16f00817bb9d7cd941343cf",
+    ): SourceBuild(
+        "d5a44ed9e2f1db5f81dbbe85408aed256f3203c5b16f00817bb9d7cd941343cf",
+        "legacy",
+        49,
+        17,
+    ),
+    (
+        "26.915.31945",
+        "9922",
+    ): SourceBuild(
+        "1f7939c1c781887c167043c4d1d307af3400d324685cfc315dfe2f80e634f483",
+        "9922",
+        49,
+        16,
+    ),
 }
-EXPECTED_CUA_IDENTIFIER_REPLACEMENTS = 49
-EXPECTED_ASAR_CUA_IDENTIFIER_REPLACEMENTS = 17
 
 
 def parse_args() -> argparse.Namespace:
@@ -321,7 +344,11 @@ def retire_stale_cached_computer_use_app() -> None:
     print(f"Stale cached Computer Use helper moved to {backup}")
 
 
-def patch_computer_use_identity(app: Path, team_identifier: str | None) -> None:
+def patch_computer_use_identity(
+    app: Path,
+    team_identifier: str | None,
+    expected_identifier_replacements: int,
+) -> None:
     """Give the copied CUA service an independent identity and trusted callers."""
     package = computer_use_package(app)
     service = package / "Codex Computer Use.app"
@@ -340,10 +367,10 @@ def patch_computer_use_identity(app: Path, team_identifier: str | None) -> None:
                 OPENAI_COMPUTER_USE_BUNDLE_IDENTIFIER,
                 COMPUTER_USE_BUNDLE_IDENTIFIER,
             )
-    if identifier_replacements != EXPECTED_CUA_IDENTIFIER_REPLACEMENTS:
+    if identifier_replacements != expected_identifier_replacements:
         raise RuntimeError(
             "expected "
-            f"{EXPECTED_CUA_IDENTIFIER_REPLACEMENTS} Computer Use identity "
+            f"{expected_identifier_replacements} Computer Use identity "
             f"references, found {identifier_replacements}"
         )
 
@@ -398,7 +425,9 @@ def patch_computer_use_identity(app: Path, team_identifier: str | None) -> None:
     executable.write_bytes(binary.replace(original_bundle_id, replacement_bundle_id))
 
 
-def patch_asar_computer_use_identity(extracted: Path) -> None:
+def patch_asar_computer_use_identity(
+    extracted: Path, expected_identifier_replacements: int
+) -> None:
     """Keep desktop launch, temp-file, and service references on the new CUA ID."""
     replacements = 0
     for candidate in extracted.rglob("*"):
@@ -408,10 +437,10 @@ def patch_asar_computer_use_identity(extracted: Path) -> None:
                 OPENAI_COMPUTER_USE_BUNDLE_IDENTIFIER,
                 COMPUTER_USE_BUNDLE_IDENTIFIER,
             )
-    if replacements != EXPECTED_ASAR_CUA_IDENTIFIER_REPLACEMENTS:
+    if replacements != expected_identifier_replacements:
         raise RuntimeError(
             "expected "
-            f"{EXPECTED_ASAR_CUA_IDENTIFIER_REPLACEMENTS} Computer Use references "
+            f"{expected_identifier_replacements} Computer Use references "
             f"in app.asar, found {replacements}"
         )
 
@@ -636,12 +665,52 @@ def sign_computer_use_code(
     )
 
 
+def remove_source_distribution_artifacts(app: Path) -> None:
+    """Remove distribution-only metadata from the independent staged copy."""
+    profile = app / "Contents" / "embedded.provisionprofile"
+    if profile.is_file():
+        profile.unlink()
+    subprocess.run(
+        ["xcrun", "stapler", "unstaple", str(app)],
+        check=False,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def sign_copied_electron_runtime(app: Path, identity: str) -> None:
+    """Sign copied Electron code and nested bundles with the selected team."""
+    bundle_suffixes = {".app", ".appex", ".bundle", ".framework", ".xpc"}
+    machos: list[Path] = []
+    bundles: list[Path] = []
+    for candidate in (app / "Contents").rglob("*"):
+        if any(part.endswith(".dSYM") for part in candidate.parts):
+            continue
+        if candidate.is_dir() and candidate.suffix in bundle_suffixes:
+            bundles.append(candidate)
+        elif is_mach_o(candidate):
+            machos.append(candidate)
+    for executable in sorted(machos, key=lambda path: len(path.parts), reverse=True):
+        sign_runtime_executable(executable, identity, runtime=False)
+    for bundle in sorted(set(bundles), key=lambda path: len(path.parts), reverse=True):
+        sign_runtime_bundle(bundle, identity, runtime=False)
+
+
 def sign_independent_app(
-    app: Path, identity: str, team_identifier: str | None
+    app: Path,
+    identity: str,
+    team_identifier: str | None,
+    expected_cua_identifier_replacements: int,
 ) -> None:
     """Apply one stable identity throughout the modified Electron bundle."""
+    remove_source_distribution_artifacts(app)
     computer_use_entitlements = capture_computer_use_entitlements(app)
-    patch_computer_use_identity(app, team_identifier)
+    patch_computer_use_identity(
+        app,
+        team_identifier,
+        expected_cua_identifier_replacements,
+    )
+    sign_copied_electron_runtime(app, identity)
     sign_computer_use_code(app, identity, computer_use_entitlements)
     run(
         [
@@ -663,6 +732,11 @@ def sign_independent_app(
             str(app),
         ]
     )
+    leftover_profile = app / "Contents" / "embedded.provisionprofile"
+    if leftover_profile.exists():
+        raise RuntimeError(
+            f"OpenAI provisioning profile was left in the independent copy: {leftover_profile}"
+        )
 
 
 def load_or_create_token() -> str:
@@ -1019,8 +1093,273 @@ def patch_renderer(extracted: Path, token: str) -> None:
     thread_bundle_path.write_text(thread_bundle, encoding="utf-8")
 
 
+def patch_renderer_9922(extracted: Path, token: str) -> None:
+    """Patch the independently verified renderer layout from desktop build 9922."""
+    webview = extracted / "webview"
+    index_path = webview / "index.html"
+    index = index_path.read_text(encoding="utf-8")
+
+    def replace_once(text: str, old: str, new: str, description: str) -> str:
+        count = text.count(old)
+        if count != 1:
+            raise RuntimeError(
+                f"expected one build-9922 {description} anchor, found {count}"
+            )
+        return text.replace(old, new, 1)
+
+    connect_anchor = "connect-src &#39;self&#39;"
+    index = replace_once(
+        index,
+        connect_anchor,
+        f"{connect_anchor} http://127.0.0.1:{CONTROL_PORT}",
+        "renderer CSP connect-src",
+    )
+    index_path.write_text(index, encoding="utf-8")
+
+    initial_bundles = list((webview / "assets").glob("app-initial-*.js"))
+    if len(initial_bundles) != 1:
+        raise RuntimeError(
+            f"expected one build-9922 initial renderer bundle, found {len(initial_bundles)}"
+        )
+    bundle_path = initial_bundles[0]
+    bundle = bundle_path.read_text(encoding="utf-8")
+    if "function CodexMuxAccountMenu(" in bundle:
+        raise RuntimeError("source app already contains the Codex multiplexer menu")
+
+    component = (PROJECT_ROOT / "ui" / "account-menu.js").read_text(
+        encoding="utf-8"
+    )
+    component = component.replace("__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT))
+    component = component.replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    for old, new in (
+        ("e7", "d6"),
+        ("kXc", "F6s"),
+        ("_H", "QB"),
+        ("CH", "iV"),
+        ("BW", "Wj"),
+        ("QLs", "$ms"),
+        ("S2", "CodexMuxPlusIcon"),
+    ):
+        component = re.sub(rf"\b{re.escape(old)}\b", new, component)
+    component = component.replace(
+        "const modalScope = Lo(Q);", "const modalScope = xf($);"
+    )
+    component = component.replace(
+        "const resolvedImageUrl = jLa(imageUrl || null);",
+        "const resolvedImageUrl = imageUrl || null;",
+    )
+    component = component.replace("const queryClient = lt();", "const queryClient = Kf();")
+    component_anchor = "function k6s(e){let t=(0,P6s.c)(258)"
+    bundle = replace_once(
+        bundle,
+        component_anchor,
+        component + "\n" + component_anchor,
+        "native profile menu component",
+    )
+
+    request_anchor = (
+        "async sendRequest(e,t,n){if(this.dispatchMessage==null)throw Error("
+        "`AppServerRequestClient is missing a message dispatcher`);return "
+        "e===`config/read`?this.sendConfigReadRequest(t,n):this.enqueueRequest("
+        "e,t,e===`plugin/list`&&n?.timeoutMs==null?{...n,timeoutMs:Den}:n)}"
+    )
+    request_replacement = request_anchor.replace(
+        "async sendRequest(e,t,n){",
+        "async sendRequest(e,t,n){t=codexMuxScopePluginRequest(e,t);",
+        1,
+    )
+    bundle = replace_once(
+        bundle,
+        request_anchor,
+        request_replacement,
+        "app-server request bridge",
+    )
+
+    profile_query_anchor = "let e=await oy.safeGet(`/wham/profiles/me`)"
+    bundle = replace_once(
+        bundle,
+        profile_query_anchor,
+        "let e=await codexMuxProfileData("
+        "globalThis.__codexMuxSelectedProfileAccountId??null)",
+        "profile stats request",
+    )
+
+    native_usage_modal_anchor = "function $ms(e){"
+    bundle = replace_once(
+        bundle,
+        native_usage_modal_anchor,
+        "function $ms(e){CodexMuxUseResetAccountState();",
+        "Usage modal component",
+    )
+
+    reset_query_anchor = (
+        "function mSi(){let e=(0,VR.c)(1);XC(),vf(null);let t;return "
+        "e[0]===Symbol.for(`react.memo_cache_sentinel`)?(t={queryKey:["
+        "`rate-limit-reset-credits`],queryFn:gSi,select:hSi,refetchInterval:"
+        "kv.ONE_MINUTE,staleTime:kv.FIVE_SECONDS},e[0]=t):t=e[0],Jf(t)}"
+    )
+    reset_query_replacement = (
+        "function mSi(){let e=window.__codexMuxResetAccountId;return Jf({"
+        "queryKey:[`rate-limit-reset-credits`,e??`primary`],"
+        "queryFn:e?()=>codexMuxRateLimitResets(e):gSi,select:hSi,"
+        "refetchInterval:kv.ONE_MINUTE,staleTime:kv.FIVE_SECONDS})}"
+    )
+    bundle = replace_once(
+        bundle,
+        reset_query_anchor,
+        reset_query_replacement,
+        "reset-credit query",
+    )
+
+    reset_mutation_anchor = (
+        "function _Si(){let e=(0,VR.c)(3),t=Kf(),n=Dv(),r;return "
+        "e[0]!==n||e[1]!==t?(r={mutationFn:vSi,onSuccess:(e,r)=>{"
+        "let{creditId:i}=r,a=e.code;if(a===`reset`||a===`already_redeemed`){"
+        "let n=e.code===`reset`?e.credit?.id??i:i;t.setQueryData("
+        "[`rate-limit-reset-credits`],e=>$bi(e,a,n))}Promise.all(["
+        "n([`rate-limit-status`]),n([`rate-limit-reset-credits`])])}},"
+        "e[0]=n,e[1]=t,e[2]=r):r=e[2],Zf(r)}"
+    )
+    reset_mutation_replacement = (
+        "function _Si(){let e=Kf(),t=Dv(),n=window.__codexMuxResetAccountId,"
+        "r=[`rate-limit-reset-credits`,n??`primary`];return Zf({"
+        "mutationFn:n?i=>codexMuxConsumeRateLimitReset(n,i):vSi,"
+        "onSuccess:(n,i)=>{let{creditId:a}=i,o=n.code;"
+        "if(o===`reset`||o===`already_redeemed`){let t=o===`reset`?"
+        "n.credit?.id??a:a;e.setQueryData(r,e=>$bi(e,o,t))}"
+        "Promise.all([t([`rate-limit-status`]),t(r)])}})}"
+    )
+    bundle = replace_once(
+        bundle,
+        reset_mutation_anchor,
+        reset_mutation_replacement,
+        "reset-credit mutation",
+    )
+
+    bundle = replace_once(
+        bundle,
+        "let y=v;if(g!=null){",
+        "let y=window.__codexMuxSelectedUsageWindows??v;if(g!=null){",
+        "usage-window selection",
+    )
+    bundle = replace_once(
+        bundle,
+        "children:[xe,Se]",
+        "children:[xe,Se,window.__codexMuxResetAccountSelector??null]",
+        "Usage sheet header",
+    )
+    bundle = replace_once(
+        bundle,
+        "usageItems:Vt",
+        "usageItems:(0,d6.jsx)(CodexMuxAccountMenu,{})",
+        "profile usage menu slot",
+    )
+    open_change_anchor = "triggerButton:Gt,onOpenChange:j,children:[M,null]"
+    bundle = replace_once(
+        bundle,
+        open_change_anchor,
+        "triggerButton:Gt,onOpenChange:CodexMuxProfileMenuOpenChange(j),"
+        "children:[M,null]",
+        "profile menu open-state hook",
+    )
+    bundle = replace_once(
+        bundle,
+        "defaultMessage:`You’re out of usage`",
+        "defaultMessage:`All connected subscriptions are depleted`",
+        "subscription depletion alert",
+    )
+    bundle_path.write_text(bundle, encoding="utf-8")
+
+    profile_bundles = list((webview / "assets").glob("profile-[0-9a-f]*.js"))
+    profile_bundles = [
+        path
+        for path in profile_bundles
+        if "function Qu(e){let t=(0,Cd.c)(294)" in path.read_text(encoding="utf-8")
+    ]
+    if len(profile_bundles) != 1:
+        raise RuntimeError(
+            f"expected one build-9922 Profile bundle, found {len(profile_bundles)}"
+        )
+    profile_path = profile_bundles[0]
+    profile = profile_path.read_text(encoding="utf-8")
+    profile_avatar_anchor = (
+        "($n=(0,$.jsx)(`section`,{\"aria-busy\":Xn,className:"
+        "`relative isolate flex flex-col items-center`,children:Qn})"
+    )
+    profile = replace_once(
+        profile,
+        profile_avatar_anchor,
+        "($n=(0,$.jsx)(`section`,{\"aria-busy\":Xn,className:"
+        "`relative isolate flex flex-col items-center`,children:["
+        "globalThis.CodexMuxProfileAvatarStack?.({onSelect:()=>Ke.refetch()})"
+        "??null,Qn]})",
+        "Profile avatar section",
+    )
+    profile_path.write_text(profile, encoding="utf-8")
+
+    plugin_scope_anchor = "action:F,children:D})"
+    plugin_bundles = [
+        path
+        for path in (webview / "assets").glob("plugins-settings-*.js")
+        if plugin_scope_anchor in path.read_text(encoding="utf-8")
+    ]
+    if len(plugin_bundles) != 1:
+        raise RuntimeError(
+            f"expected one build-9922 Plugins settings bundle, found {len(plugin_bundles)}"
+        )
+    plugin_path = plugin_bundles[0]
+    plugin = plugin_path.read_text(encoding="utf-8")
+    plugin = replace_once(
+        plugin,
+        plugin_scope_anchor,
+        "action:F,children:[globalThis.CodexMuxPluginScope?.()??null,D]})",
+        "Plugins settings content",
+    )
+    plugin_path.write_text(plugin, encoding="utf-8")
+
+    thread_anchor = "function KT(e){let t=(0,YT.c)(42)"
+    thread_bundles = [
+        path
+        for path in (webview / "assets").glob("local-conversation-thread-*.js")
+        if thread_anchor in path.read_text(encoding="utf-8")
+    ]
+    if len(thread_bundles) != 1:
+        raise RuntimeError(
+            f"expected one build-9922 thread bundle, found {len(thread_bundles)}"
+        )
+    thread_path = thread_bundles[0]
+    thread = thread_path.read_text(encoding="utf-8")
+    thread_component = (PROJECT_ROOT / "ui" / "thread-subscription.js").read_text(
+        encoding="utf-8"
+    )
+    thread_component = thread_component.replace(
+        "__CODEX_MUX_CONTROL_PORT__", str(CONTROL_PORT)
+    ).replace("__CODEX_MUX_CONTROL_TOKEN__", token)
+    thread_component = re.sub(r"\bzE\b", "XT", thread_component)
+    thread_component = re.sub(r"\bTE\b", "CodexMuxReact", thread_component)
+    thread_component = thread_component.replace("$n(sr)", "ju(il)")
+    thread_component = thread_component.replace("K.Section", "$.Section")
+    thread_component = "const CodexMuxReact=et();\n" + thread_component
+    thread = replace_once(
+        thread,
+        thread_anchor,
+        thread_component + "\n" + thread_anchor,
+        "thread summary component",
+    )
+    summary_children_anchor = "children:[D,g,O,k,E,A]"
+    thread = replace_once(
+        thread,
+        summary_children_anchor,
+        "children:[D,g,O,(0,XT.jsx)(CodexMuxThreadSubscription,{}),k,E,A]",
+        "thread summary section list",
+    )
+    thread_path.write_text(thread, encoding="utf-8")
+
+
 def patch_desktop_profile(
-    extracted: Path, installed_computer_use_app: Path
+    extracted: Path,
+    installed_computer_use_app: Path,
+    renderer_layout: str,
 ) -> None:
     """Give the copied Electron app its own user-data and single-instance scope."""
     bootstrap_files = list((extracted / ".vite" / "build").glob("bootstrap-*.js"))
@@ -1056,13 +1395,23 @@ def patch_desktop_profile(
         raise RuntimeError("could not isolate the copied ChatGPT desktop profile")
 
     # The copied app must never replace itself with an unpatched official update.
-    updater_pattern = re.compile(
-        r"await [A-Za-z_$][\w$]*\.initialize\(\);"
-        r"(?=try\{let\{runMainAppStartup:)"
-    )
-    bootstrap, updater_replacements = updater_pattern.subn("", bootstrap, count=1)
-    if updater_replacements != 1:
-        raise RuntimeError("could not disable updates in the copied ChatGPT app")
+    if renderer_layout == "9922":
+        updater_anchor = (
+            "enableUpdater:j.shouldIncludeUpdater(d,process.platform,process.env)"
+        )
+        if bootstrap.count(updater_anchor) != 1:
+            raise RuntimeError("could not disable updates in the copied ChatGPT app")
+        bootstrap = bootstrap.replace(updater_anchor, "enableUpdater:!1", 1)
+    else:
+        updater_pattern = re.compile(
+            r"await [A-Za-z_$][\w$]*\.initialize\(\);"
+            r"(?=try\{let\{runMainAppStartup:)"
+        )
+        bootstrap, updater_replacements = updater_pattern.subn(
+            "", bootstrap, count=1
+        )
+        if updater_replacements != 1:
+            raise RuntimeError("could not disable updates in the copied ChatGPT app")
     bootstrap_path.write_text(bootstrap, encoding="utf-8")
 
     main_files = list((extracted / ".vite" / "build").glob("main-*.js"))
@@ -1184,7 +1533,10 @@ def patch_app(
     source_build = str(source_info.get("CFBundleVersion", "unknown"))
     source_asar = source / "Contents" / "Resources" / "app.asar"
     source_asar_hash = hashlib.sha256(source_asar.read_bytes()).hexdigest()
-    expected_asar_hash = TESTED_SOURCE_BUILDS.get((source_version, source_build))
+    source_compatibility = TESTED_SOURCE_BUILDS.get((source_version, source_build))
+    expected_asar_hash = (
+        source_compatibility.asar_hash if source_compatibility is not None else None
+    )
     print(
         f"Source ChatGPT version: {source_version} ({source_build}), "
         f"app.asar {source_asar_hash}"
@@ -1200,6 +1552,14 @@ def patch_app(
             "the patch will continue only while every expected anchor matches.",
             file=sys.stderr,
         )
+        if source_compatibility is None:
+            source_compatibility = SourceBuild(
+                source_asar_hash,
+                "legacy",
+                49,
+                17,
+            )
+    assert source_compatibility is not None
 
     for tool in ("codesign", "ditto", "go", "npm", "security", "xcrun"):
         require_tool(tool)
@@ -1242,9 +1602,19 @@ def patch_app(
         original_asar = resources / "app.asar"
         print("Patching desktop profile and renderer…")
         run([str(asar), "extract", str(original_asar), str(extracted)])
-        patch_asar_computer_use_identity(extracted)
-        patch_desktop_profile(extracted, installed_computer_use_app)
-        patch_renderer(extracted, token)
+        patch_asar_computer_use_identity(
+            extracted,
+            source_compatibility.asar_cua_replacements,
+        )
+        patch_desktop_profile(
+            extracted,
+            installed_computer_use_app,
+            source_compatibility.renderer_layout,
+        )
+        if source_compatibility.renderer_layout == "9922":
+            patch_renderer_9922(extracted, token)
+        else:
+            patch_renderer(extracted, token)
         sign_native_code_tree(extracted, signing_identity)
         repacked_asar = temporary_path / "app.asar"
         run(
@@ -1284,7 +1654,12 @@ def patch_app(
 
         patch_info_plist(staged_app, original_asar, team_identifier)
         print(f"Signing independent app copy with {signing_identity}…")
-        sign_independent_app(staged_app, signing_identity, team_identifier)
+        sign_independent_app(
+            staged_app,
+            signing_identity,
+            team_identifier,
+            source_compatibility.cua_package_replacements,
+        )
         verify_signed_code(
             staged_app,
             DESKTOP_BUNDLE_IDENTIFIER,

@@ -29,6 +29,11 @@ inside those definitions are therefore copied into every isolated account home
 with mode `0600`; account isolation is not a separate secret boundary for
 shared plugin configuration.
 
+Historical rollout files and SQLite rows are never migrated implicitly. The
+explicit offline migration refuses file-content and thread-ID collisions,
+checks that related processes are stopped without terminating them, backs up
+the primary index, and rolls back files and database changes if interrupted.
+
 ## Network
 
 The control server binds to `127.0.0.1`. Private endpoints require the token
@@ -42,9 +47,12 @@ documented ChatGPT profile and rate-limit APIs.
 ## Signing and native access
 
 The source app is copied into a temporary staging directory. Native modules,
-the Computer Use helper, Node runtime, mux, and final app are signed under one
-selected Apple team and verified before replacement. Official OpenAI
-application-group and keychain entitlements are removed from modified callers.
+the Electron runtime, Computer Use helper, Node runtime, mux, and final app are
+signed under one selected Apple team and verified before replacement. The team
+identifier comes from the signature on a fresh probe, not from a certificate
+display-name suffix. Distribution provisioning and notarization artifacts are
+removed from the independent staged copy. Official OpenAI application-group and
+keychain entitlements are removed from modified callers.
 
 The native helper's caller allowlist is patched to the selected team and the
 independent desktop bundle ID. This is required for the helper's peer checks;

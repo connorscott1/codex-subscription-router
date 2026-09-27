@@ -30,6 +30,11 @@ If the owner is depleted, the multiplexer resumes the rollout on an account
 with capacity and updates ownership. Threads do not migrate for ordinary load
 balancing.
 
+Requests configured for a custom model provider or non-OpenAI base URL use an
+external-provider lane. They are forwarded to the selected account's child but
+are excluded from ChatGPT quota accounting, depletion failover, and thread-owner
+changes, including when the external provider returns a limit error.
+
 ## Account isolation
 
 The Primary account uses `~/.codex`. Added accounts use
@@ -37,15 +42,23 @@ The Primary account uses `~/.codex`. Added accounts use
 the Primary account, excluding credential-store settings and project trust.
 Each isolated account forces file-backed CLI and MCP OAuth credentials.
 
+Legacy per-account rollout directories and SQLite indexes are not imported on
+startup. Their presence is a fail-closed condition. The optional offline
+migration plans all file hashes and SQLite thread IDs first, refuses collisions,
+requires related processes to be stopped, uses an exclusive database lock, and
+keeps a rollback receipt and backup until installation commits.
+
 ## Desktop integration
 
 The patcher extracts `app.asar`, verifies exact upstream anchors, inserts the
 account UI, disables self-update, and repacks the archive with an updated
 integrity hash. The app receives a separate Chromium profile and URL scheme.
 
-The copied Computer Use service, Node runtime, and callers are re-signed under
-one Apple team. The helper uses a separate bundle identity and socket, avoiding
-the official app's privacy grants and app-group container.
+The copied Electron runtime, Computer Use service, Node runtime, and callers are
+re-signed under one Apple team. The patcher derives that team from a freshly
+signed probe instead of parsing the signing identity's display name. The helper
+uses a separate bundle identity and socket, avoiding the official app's privacy
+grants and app-group container.
 
 ## Plugin behavior
 

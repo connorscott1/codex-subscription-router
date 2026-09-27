@@ -24,6 +24,11 @@ async function codexMuxRequest(path, options = {}) {
 }
 
 const CODEX_MUX_ACCOUNT_SCOPED_PLUGIN_METHODS = new Set([
+  "app/list",
+  "app/installed",
+  "app/read",
+  "mcpServerStatus/list",
+  "mcpServer/oauth/login",
   "list-apps",
   "list-installed-apps",
   "read-apps",
