@@ -10,10 +10,14 @@ file, signing certificate, provisioning profile, or account data.
    `docs/COMPATIBILITY.md`.
 4. Run `npm ci --ignore-scripts`, `npm run check`, and
    `npm run release:check` on macOS.
-5. Complete `docs/SMOKE-TEST.md` with a team-backed signature and record the
-   exact commit, macOS version, and signing team in the release draft.
-6. Review `git diff --check` and confirm no ignored credentials or app bundles
-   are staged.
+5. Complete `docs/SMOKE-TEST.md` with a locally selected team-backed signature.
+   Record the exact commit, macOS version, and pass/fail results, but never the
+   local signing identity, team ID, certificate fingerprint, keychain identifiers,
+   or raw signing diagnostics. Use synthetic test fixtures.
+6. Review `git diff --check`, all commits being published, and the staged files.
+   Confirm no credentials, personal signing metadata, private notes, or app
+   bundles are included. Ignore rules and automated release checks alone do not
+   establish that history or diagnostic text is safe to publish.
 7. Configure the protected `release` environment, tag the reviewed commit as
    `vX.Y.Z`, and push the tag.
 

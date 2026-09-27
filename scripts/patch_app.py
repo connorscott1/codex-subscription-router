@@ -122,6 +122,18 @@ def parse_args() -> argparse.Namespace:
 
 
 def run(command: list[str], *, cwd: Path | None = None) -> None:
+    if Path(command[0]).name == "codesign":
+        # Signing failures must not echo local identities or fingerprints.
+        try:
+            subprocess.run(command, cwd=cwd, check=True, capture_output=True)
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError(
+                f"code-signing operation failed (exit {error.returncode}); "
+                "check local signing configuration; identity details withheld"
+            ) from None
+        except OSError:
+            raise RuntimeError("could not execute the code-signing tool") from None
+        return
     subprocess.run(command, cwd=cwd, check=True)
 
 
@@ -210,7 +222,7 @@ def verify_signed_code(
             f"unexpected signing identifier on {path}: {identifier!r}"
         )
     if team != expected_team:
-        raise RuntimeError(f"unexpected signing team on {path}: {team!r}")
+        raise RuntimeError("signing team mismatch; identity details withheld")
 
 
 def existing_signing_team(path: Path) -> str | None:
@@ -472,10 +484,13 @@ TEAM_SCOPED_ENTITLEMENTS = (
     "com.apple.security.application-groups",
     "keychain-access-groups",
 )
+# The copied official app's push grant requires its provisioning profile.
+# An independently signed local build cannot inherit that grant.
+PROFILE_SCOPED_ENTITLEMENTS = ("com.apple.developer.aps-environment",)
 
 
 def sanitized_runtime_entitlements(executable: Path) -> dict[str, object] | None:
-    """Keep runtime capabilities while removing the official app's team grants."""
+    """Keep runtime capabilities without inherited team or profile grants."""
     result = subprocess.run(
         ["codesign", "--display", "--entitlements", ":-", str(executable)],
         check=True,
@@ -492,7 +507,7 @@ def sanitized_runtime_entitlements(executable: Path) -> dict[str, object] | None
         ) from error
     if not isinstance(entitlements, dict):
         raise RuntimeError(f"invalid signing entitlements on {executable}")
-    for key in TEAM_SCOPED_ENTITLEMENTS:
+    for key in (*TEAM_SCOPED_ENTITLEMENTS, *PROFILE_SCOPED_ENTITLEMENTS):
         entitlements.pop(key, None)
     return entitlements or None
 
@@ -1653,7 +1668,7 @@ def patch_app(
         bundled_codex.chmod(0o755)
 
         patch_info_plist(staged_app, original_asar, team_identifier)
-        print(f"Signing independent app copy with {signing_identity}…")
+        print("Signing independent app copy with the locally selected identity…")
         sign_independent_app(
             staged_app,
             signing_identity,
