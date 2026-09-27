@@ -1,9 +1,60 @@
 """Signing regression tests; no signing certificate or macOS tools required."""
 import subprocess
+import plistlib
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import patch_app
+
+
+class SigningPrivacyTests(unittest.TestCase):
+    def test_codesign_output_is_captured(self):
+        with mock.patch.object(patch_app.subprocess, "run") as run:
+            patch_app.run(["codesign", "--sign", "synthetic-selector", "fixture"])
+        self.assertTrue(run.call_args.kwargs["capture_output"])
+
+    def test_signing_failure_does_not_echo_selector_or_diagnostics(self):
+        command = ["codesign", "--sign", "synthetic-selector", "fixture"]
+        failure = subprocess.CalledProcessError(
+            1, command, output=b"synthetic-fingerprint", stderr=b"synthetic-team"
+        )
+        with mock.patch.object(patch_app.subprocess, "run", side_effect=failure), \
+             self.assertRaises(RuntimeError) as caught:
+            patch_app.run(command)
+        for value in ("synthetic-selector", "synthetic-fingerprint", "synthetic-team"):
+            self.assertNotIn(value, str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_other_build_commands_keep_existing_behavior(self):
+        with mock.patch.object(patch_app.subprocess, "run") as run:
+            patch_app.run(["go", "build"])
+        self.assertNotIn("capture_output", run.call_args.kwargs)
+
+
+class IndependentBundleTests(unittest.TestCase):
+    def test_sanitization_removes_inherited_grants_but_keeps_runtime(self):
+        original = {
+            "com.apple.application-identifier": "TESTTEAM01.example.app",
+            "com.apple.developer.team-identifier": "TESTTEAM01",
+            "com.apple.security.application-groups": ["TESTTEAM01.group"],
+            "keychain-access-groups": ["TESTTEAM01.shared"],
+            "com.apple.developer.aps-environment": "production",
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+            "com.apple.security.network.client": True,
+        }
+        output = subprocess.CompletedProcess(
+            args=["codesign"], returncode=0, stdout=plistlib.dumps(original), stderr=b""
+        )
+        with mock.patch.object(patch_app.subprocess, "run", return_value=output):
+            result = patch_app.sanitized_runtime_entitlements(Path("copied-executable"))
+        self.assertEqual(result, {
+            "com.apple.security.cs.allow-jit": True,
+            "com.apple.security.cs.allow-unsigned-executable-memory": True,
+            "com.apple.security.network.client": True,
+        })
+        self.assertEqual(original["com.apple.developer.aps-environment"], "production")
 
 
 class SigningTeamTests(unittest.TestCase):

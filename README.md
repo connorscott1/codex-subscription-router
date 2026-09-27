@@ -73,8 +73,8 @@ Codex Subscription Router currently targets:
 | Component | Supported value |
 | --- | --- |
 | Platform | macOS on Apple silicon |
-| Official ChatGPT version | `26.803.61601` |
-| Official bundle build | `6396` |
+| Official ChatGPT versions | `26.803.61601`, `26.915.31945` |
+| Official bundle builds | `6396`, `9922` |
 | Go | 1.26 or newer |
 | Node.js | 22.12 or newer |
 
@@ -146,6 +146,8 @@ CODEX_MUX_SIGNING_IDENTITY="Developer ID Application: Example Corp (TEAMID1234)"
 The patcher resolves the signing team from a temporary signed executable, so
 Apple Development identities whose display-name suffix differs from their team ID
 are supported. `CODEX_MUX_SIGNING_IDENTITY` also accepts a certificate fingerprint.
+The parenthesized suffix in an identity name is never assumed to be its team ID;
+the actual `TeamIdentifier` is read back from a freshly signed probe.
 
 Reuse the same Apple team for every rebuild. Changing teams changes the app's
 designated requirement and can invalidate existing macOS privacy consent. The
@@ -204,6 +206,9 @@ starts another sign-in.
 | Custom provider or non-OpenAI base URL | Sent through the account's configured Codex provider without pooled ChatGPT quota |
 
 The subscription assigned to the current thread appears in its pinned summary.
+External-provider requests never participate in ChatGPT quota selection,
+depletion failover, or ownership changes. Their cost, limits, and availability
+remain the responsibility of the configured provider.
 
 ## Profiles, plugins, and resets
 
@@ -257,6 +262,13 @@ are never returned by the control API. Account directories are owner-only.
 Plugin configuration is intentionally synchronized from the Primary account.
 Inline secrets inside shared MCP configuration are therefore copied to each
 isolated account home; the account homes are not separate secret boundaries.
+
+Legacy secondary-account rollout and SQLite data is never moved during normal
+startup or installation. If legacy data exists, startup fails closed until an
+offline migration is explicitly reviewed and run with `--migrate-legacy-state`.
+The migration requires the related processes to be stopped, checks file and
+thread-ID collisions before writing, creates a recoverable backup, and rolls
+back incomplete work. It does not merge colliding histories silently.
 
 See [SECURITY.md](SECURITY.md) before reporting a credential, signing, or local
 control-service issue.
